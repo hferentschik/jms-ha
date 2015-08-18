@@ -19,10 +19,13 @@ package org.jboss.as.quickstarts.jms;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
+import javax.jms.Connection;
 import javax.jms.ConnectionFactory;
-import javax.jms.Destination;
-import javax.jms.JMSConsumer;
-import javax.jms.JMSContext;
+import javax.jms.MessageConsumer;
+import javax.jms.MessageProducer;
+import javax.jms.Queue;
+import javax.jms.Session;
+import javax.jms.TextMessage;
 import javax.naming.Context;
 import javax.naming.InitialContext;
 import javax.naming.NamingException;
@@ -30,21 +33,20 @@ import javax.naming.NamingException;
 import asg.cliche.Command;
 import asg.cliche.Param;
 import asg.cliche.ShellFactory;
-import org.hornetq.jms.client.HornetQDestination;
-import org.hornetq.jms.server.embedded.EmbeddedJMS;
 
 @SuppressWarnings("unused")
 public class JMSClient {
 	private static final Logger log = Logger.getLogger( JMSClient.class.getName() );
 
-	// Set up all the default values
-	private static final String DEFAULT_MESSAGE = "Message id {count}";
-	private static final String DEFAULT_CONNECTION_FACTORY = "ConnectionFactory";
-	private static final String DEFAULT_DESTINATION = "jms/queue/test";
+	private static final String DEFAULT_CONNECTION_FACTORY = "jms/RemoteConnectionFactory";
+	private static final String DEFAULT_DESTINATION = "jms/queue/hsearch";
 	private static final String DEFAULT_USERNAME = "guest";
 	private static final String DEFAULT_PASSWORD = "guest";
-	private static final String INITIAL_CONTEXT_FACTORY = "org.jboss.naming.remote.client.InitialContextFactory";
-	private static final String PROVIDER_URL = "http-remoting://127.0.0.1:8080";
+	private static final String DEFAULT_INITIAL_CONTEXT_FACTORY = "org.jboss.naming.remote.client.InitialContextFactory";
+	// TODO - probably need to specify a list of servers. One might be down.
+	private static final String DEFAULT_PROVIDER_URL = "http-remoting://10.128.0.2:8080";
+	private static final String DEFAULT_MESSAGE = "Message id {count}";
+
 	private static final AtomicInteger counter = new AtomicInteger();
 
 	private static String userName = DEFAULT_USERNAME;
@@ -52,56 +54,50 @@ public class JMSClient {
 	private static String connectionFactoryName = DEFAULT_CONNECTION_FACTORY;
 	private static String message = DEFAULT_MESSAGE;
 	private static String destination = DEFAULT_DESTINATION;
-	private static String providerUrl = PROVIDER_URL;
+	private static String providerUrl = DEFAULT_PROVIDER_URL;
 
 	private static InitialContext initialContext;
 	private static ConnectionFactory connectionFactory;
-	private static Destination jmsDestination;
-	private static EmbeddedJMS jms;
+	private static Queue queue;
+
+	public static void main(String[] args) throws Exception {
+		Runtime.getRuntime().addShutdownHook( new JMSShutdownThread() );
+
+		JMSClient jmsClient = new JMSClient();
+		jmsClient.init();
+		ShellFactory.createConsoleShell( "jms", "", jmsClient ).commandLoop();
+	}
 
 	@Command(description = "Sets the name of the connection factory (default '" + DEFAULT_CONNECTION_FACTORY + "')")
 	public void connectionFactoryName(@Param(name = "name", description = "The JMS factory name") String factoryName) {
 		JMSClient.connectionFactoryName = factoryName;
+		updateConnectionFactory();
 	}
 
-	@Command(description = "Sets the user name (default '" + DEFAULT_USERNAME + "')")
+	@Command(description = "Sets the JMS provider URL (default '" + DEFAULT_PROVIDER_URL + "')")
+	public void providerURL(@Param(name = "provider") String provider) {
+		JMSClient.providerUrl = provider;
+	}
+
+	@Command//(description = "Sets the user name (default '" + DEFAULT_USERNAME + "')")
 	public void userName(@Param(name = "name", description = "The JMS user name") String userName) {
 		JMSClient.userName = userName;
 	}
 
-	@Command(description = "Sets the password (default '" + DEFAULT_PASSWORD + "')")
+	@Command//(description = "Sets the password (default '" + DEFAULT_PASSWORD + "')")
 	public void password(@Param(name = "name", description = "The JMS password") String password) {
 		JMSClient.password = password;
-	}
-
-	@Command(description = "Sets the JMS message content (default '" + DEFAULT_MESSAGE + "')")
-	public void message(@Param(name = "message") String message) {
-		JMSClient.message = message;
 	}
 
 	@Command(description = "Sets the JMS destination (default '" + DEFAULT_DESTINATION + "')")
 	public void destination(@Param(name = "destination") String destination) {
 		JMSClient.destination = destination;
+		updateQueue();
 	}
 
-	@Command(description = "Sets the JMS provider URL (default '" + PROVIDER_URL + "')")
-	public void providerURL(@Param(name = "provider") String provider) {
-		JMSClient.providerUrl = provider;
-	}
-
-	@Command(description = "(Re-)Init InitialContext", abbrev = "i")
-	public void init() throws Exception {
-		try {
-			createInitialContext();
-
-			log.info( "Attempting to acquire connection factory \"" + connectionFactoryName + "\"" );
-			//JMSClient.connectionFactory = (ConnectionFactory) initialContext.lookup( connectionFactoryName );
-			JMSClient.connectionFactory = (ConnectionFactory) jms.lookup( "ConnectionFactory" );
-			log.info( "Found connection factory \"" + connectionFactoryName + "\" in JNDI" );
-		}
-		catch ( Exception e ) {
-			log.severe( e.toString() );
-		}
+	@Command(description = "Sets the JMS message content (default '" + DEFAULT_MESSAGE + "')")
+	public void message(@Param(name = "message") String message) {
+		JMSClient.message = message;
 	}
 
 	@Command(description = "Print InitialContext info", abbrev = "p")
@@ -112,62 +108,53 @@ public class JMSClient {
 
 	@Command(description = "Send the specified amount of messages", abbrev = "s")
 	public void sendMessage(@Param(name = "count", description = "Message count") int count) throws Exception {
-		Destination destination = getDestination();
+		try (Connection connection = createConnection();
+			 Session session = connection.createSession( false, Session.AUTO_ACKNOWLEDGE );
+			 MessageProducer messageProducer = session.createProducer( queue )) {
 
-		//Destination destination = (Destination)jms.lookup(DEFAULT_DESTINATION);
-//		final String groupAddress = "231.7.7.7";
-//		final int groupPort = 9876;
-//		ServerLocator locator = HornetQClient.createServerLocatorWithHA(
-//				new DiscoveryGroupConfiguration(
-//						groupAddress, groupPort,
-//						10000,
-//						new UDPBroadcastGroupConfiguration( groupAddress, groupPort, "127.0.0.1", -1 )
-//				)
-//		);
-//		ClientSessionFactory factory = locator.createSessionFactory();
-//		ClientSession session1 = factory.createSession();
+			connection.start();
 
-
-		try (JMSContext context = connectionFactory.createContext( userName, password )) {
 			// Send the specified number of messages
+			TextMessage textMessage = session.createTextMessage();
 			for ( int i = 0; i < count; i++ ) {
 				String messageContent = message.replaceAll( "\\{count\\}", String.valueOf( counter.addAndGet( 1 ) ) );
 				log.info( "Sending message with content: '" + messageContent + "'" );
-				context.createProducer().send( destination, messageContent );
+				textMessage.setText( messageContent );
+				messageProducer.send( textMessage );
 			}
 		}
 	}
 
 	@Command(description = "Recieve the specified amount of messages", abbrev = "r")
 	public void receiveMessage(@Param(name = "count", description = "Message count") int count) throws Exception {
-		Destination destination = getDestination();
+		try (Connection connection = createConnection();
+			 Session session = connection.createSession( false, Session.AUTO_ACKNOWLEDGE );
+			 MessageConsumer messageConsumer = session.createConsumer( queue )) {
 
-		try (JMSContext context = connectionFactory.createContext( userName, password )) {
-			// Create the JMS consumer
-			JMSConsumer consumer = context.createConsumer( destination );
-			// Then receive the same number of messages that were sent
+			connection.start();
 			for ( int i = 0; i < count; i++ ) {
-				String text = consumer.receiveBody( String.class, 5000 );
-				log.info( "Received message with content " + text );
+				TextMessage textMessage = (TextMessage) messageConsumer.receive();
+				log.info( "Received message with content " + textMessage.getText() );
 			}
 		}
 	}
 
-	public static void main(String[] args) throws Exception {
-		jms = new EmbeddedJMS();
-		jms.start();
-
-		Runtime.getRuntime().addShutdownHook( new JMSShutdownThread() );
-
-		JMSClient jmsClient = new JMSClient();
-		jmsClient.init();
-		ShellFactory.createConsoleShell( "jms", "", jmsClient ).commandLoop();
+	//@Command(description = "(Re-)Init InitialContext", abbrev = "i")
+	private void init() throws Exception {
+		try {
+			createInitialContext();
+			updateConnectionFactory();
+			updateQueue();
+		}
+		catch ( Exception e ) {
+			log.severe( e.toString() );
+		}
 	}
 
 	private void createInitialContext() {
 		// Set up the namingContext for the JNDI lookup
 		final Properties env = new Properties();
-		env.put( Context.INITIAL_CONTEXT_FACTORY, INITIAL_CONTEXT_FACTORY );
+		env.put( Context.INITIAL_CONTEXT_FACTORY, DEFAULT_INITIAL_CONTEXT_FACTORY );
 		env.put( Context.PROVIDER_URL, providerUrl );
 		env.put( Context.SECURITY_PRINCIPAL, userName );
 		env.put( Context.SECURITY_CREDENTIALS, password );
@@ -179,9 +166,37 @@ public class JMSClient {
 		}
 	}
 
-	private Destination getDestination() throws NamingException {
-		//return HornetQDestination.fromAddress( destination );
-		return (Destination) initialContext.lookup( destination );
+	private void updateQueue() {
+		try {
+			log.info( "Attempting to lookup queue \"" + destination + "\"" );
+			JMSClient.queue = (Queue) initialContext.lookup( destination );
+			log.info( "Found queue \"" + queue.toString() + "\" in JNDI" );
+		}
+		catch ( NamingException e ) {
+			log.severe( e.toString() );
+		}
+	}
+
+	private void updateConnectionFactory() {
+		try {
+			log.info( "Attempting to lookup connection factory \"" + connectionFactoryName + "\"" );
+			JMSClient.connectionFactory = (ConnectionFactory) initialContext.lookup( connectionFactoryName );
+			log.info( "Found connection factory \"" + connectionFactory.toString() + "\" in JNDI" );
+		}
+		catch ( NamingException e ) {
+			log.severe( e.toString() );
+		}
+	}
+
+	private Connection createConnection() throws Exception {
+		Connection connection;
+		if ( userName != null && password != null ) {
+			connection = connectionFactory.createConnection( userName, password );
+		}
+		else {
+			connection = connectionFactory.createConnection();
+		}
+		return connection;
 	}
 
 	public static class JMSShutdownThread extends Thread {
@@ -199,16 +214,6 @@ public class JMSClient {
 				}
 				catch ( NamingException e ) {
 					// ingnore
-				}
-			}
-
-			if ( jms != null ) {
-				try {
-					System.out.println( "Closing embedded JMS" );
-					jms.stop();
-				}
-				catch ( Exception e ) {
-					// ignore
 				}
 			}
 		}

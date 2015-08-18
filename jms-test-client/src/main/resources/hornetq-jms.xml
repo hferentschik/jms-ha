@@ -11,4 +11,9 @@
         <client-id>42</client-id>
     </connection-factory>
 
+    <queue name="test queue">
+        <entry name="/jms/queue/test"/>
+        <entry name="java:jboss/exported/jms/queue/test"/>
+    </queue>
+
 </configuration> 
