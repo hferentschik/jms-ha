@@ -1,0 +1,13 @@
+server-1:
+  build: server-1
+  expose:
+    - 8080
+  cap_add:
+    - NET_ADMIN
+
+server-2:
+  build: server-2
+  expose:
+    - 8080
+  cap_add:
+    - NET_ADMIN
